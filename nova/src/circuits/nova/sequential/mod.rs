@@ -24,6 +24,9 @@ use crate::{
 
 use super::{public_params, NovaConstraintSynthesizer, StepCircuit};
 
+#[cfg(feature = "spartan")]
+pub mod compression;
+
 mod augmented;
 use augmented::{
     NovaAugmentedCircuit, NovaAugmentedCircuitInput, NovaAugmentedCircuitNonBaseInput,

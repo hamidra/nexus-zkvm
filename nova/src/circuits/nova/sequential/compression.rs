@@ -16,31 +16,26 @@ use ark_spartan::{
 use ark_std::{cmp::max, marker::PhantomData};
 use merlin::Transcript;
 
-use super::PublicParams;
+use super::{augmented::SQUEEZE_NATIVE_ELEMENTS_NUM, IVCProof, IVCProofNonBase, PublicParams};
 use crate::{
     absorb::CryptographicSpongeExt,
     commitment::CommitmentScheme,
-    folding::nova::cyclefold::nimfs::{
-        NIMFSProof, R1CSInstance, RelaxedR1CSInstance, RelaxedR1CSWitness,
+    folding::nova::cyclefold::{
+        nimfs::{NIMFSProof, R1CSInstance, RelaxedR1CSInstance, RelaxedR1CSWitness},
+        Error as NovaError,
     },
-    nova::pcd::{augmented::SQUEEZE_NATIVE_ELEMENTS_NUM, PCDNode},
+    nova::pcd::compression::{
+        commitment_utils::PolyVectorCommitment,
+        error::{ProofError, SpartanError},
+    },
     r1cs::R1CSShape,
     StepCircuit, LOG_TARGET,
 };
 
-pub mod commitment_utils;
-mod conversion;
-mod secondary;
-
-pub mod error;
-
-pub use commitment_utils::PolyVectorCommitment;
-pub use error::{ProofError, SpartanError};
-
 pub type PVC<G, PC> = PolyVectorCommitment<Projective<G>, PC>;
 
 #[derive(CanonicalSerialize, CanonicalDeserialize)]
-pub struct CompressedPCDProof<G1, G2, PC, C2, RO, SC>
+pub struct CompressedIVCProof<G1, G2, PC, C2, RO, SC>
 where
     G1: SWCurveConfig,
     G2: SWCurveConfig,
@@ -50,16 +45,12 @@ where
     RO: SpongeWithGadget<G1::ScalarField> + Send + Sync,
     SC: StepCircuit<G1::ScalarField>,
 {
+    z_0: Vec<G1::ScalarField>,
     pub i: u64,
-    pub j: u64,
-
     pub z_i: Vec<G1::ScalarField>,
-    pub z_j: Vec<G1::ScalarField>,
-
     pub U: RelaxedR1CSInstance<G1, PVC<G1, PC>>,
     pub u: R1CSInstance<G1, PVC<G1, PC>>,
     pub U_secondary: RelaxedR1CSInstance<G2, C2>,
-
     pub W_secondary_prime: RelaxedR1CSWitness<G2>,
 
     pub spartan_proof: spartan_snark::SNARK<Projective<G1>, PC>,
@@ -79,7 +70,7 @@ pub struct SNARKKey<G: CurveGroup, PC: PolyCommitmentScheme<G>> {
 
 impl<G: CurveGroup, PC: PolyCommitmentScheme<G>> SNARKKey<G, PC> {
     /// convenience function to derive the minimum log size of the SRS
-    /// needed to support compession for a given `shape`.
+    /// needed to support compression for a given `shape`.
     pub fn get_min_srs_size(shape: &R1CSShape<G>) -> usize {
         let R1CSShape {
             num_constraints,
@@ -161,8 +152,8 @@ where
     pub fn compress(
         params: &PublicParams<G1, G2, PVC<G1, PC>, C2, RO, SC>,
         key: &SNARKKey<Projective<G1>, PC>,
-        pcd_proof: PCDNode<G1, G2, PVC<G1, PC>, C2, RO, SC>,
-    ) -> Result<CompressedPCDProof<G1, G2, PC, C2, RO, SC>, SpartanError> {
+        ivc_proof: IVCProof<G1, G2, PVC<G1, PC>, C2, RO, SC>,
+    ) -> Result<CompressedIVCProof<G1, G2, PC, C2, RO, SC>, SpartanError> {
         let _span = tracing::debug_span!(target: LOG_TARGET, "Spartan_prove").entered();
         let SNARKKey {
             shape,
@@ -170,19 +161,19 @@ where
             computation_decomm,
             snark_gens,
         } = key;
-        let PCDNode {
-            i,
-            j,
-            z_i,
-            z_j,
+        let IVCProof { z_0, non_base, .. } = ivc_proof;
+
+        let IVCProofNonBase {
             U,
             W,
             U_secondary,
             W_secondary,
             u,
             w,
-            ..
-        } = pcd_proof;
+            i,
+            z_i,
+        } = non_base.ok_or(SpartanError::InvalidProof(ProofError::InvalidProof))?;
+
         // First, we fold the instance-witness pair `(u,w)` into the running instances.
         let (folding_proof, (U_prime, W_prime), (_U_secondary_prime, W_secondary_prime)) =
             NIMFSProof::prove(
@@ -208,11 +199,10 @@ where
             &mut transcript,
         );
 
-        Ok(CompressedPCDProof {
+        Ok(CompressedIVCProof {
+            z_0: z_0.clone(),
             i,
-            j,
             z_i: z_i.clone(),
-            z_j: z_j.clone(),
             U,
             u,
             U_secondary,
@@ -227,16 +217,14 @@ where
     pub fn verify(
         key: &SNARKKey<Projective<G1>, PC>,
         params: &PublicParams<G1, G2, PVC<G1, PC>, C2, RO, SC>,
-        proof: &CompressedPCDProof<G1, G2, PC, C2, RO, SC>,
+        proof: &CompressedIVCProof<G1, G2, PC, C2, RO, SC>,
     ) -> Result<(), SpartanError> {
         let _span =
-            tracing::debug_span!(target: LOG_TARGET, "Spartan_verify", i = proof.i, j = proof.j,)
-                .entered();
-        let CompressedPCDProof {
+            tracing::debug_span!(target: LOG_TARGET, "Spartan_verify", i = proof.i).entered();
+        let CompressedIVCProof {
+            z_0,
             i,
-            j,
             z_i,
-            z_j,
             U,
             u,
             U_secondary,
@@ -245,14 +233,14 @@ where
             folding_proof,
             ..
         } = proof;
+
         // First, we hash the running instances U, U_secondary and check that
         // the public IO of `u` is equal to this hash value.
         let mut random_oracle = RO::new(&params.ro_config);
         random_oracle.absorb(&params.digest);
         random_oracle.absorb(&G1::ScalarField::from(*i));
-        random_oracle.absorb(&G1::ScalarField::from(*j));
+        random_oracle.absorb(z_0);
         random_oracle.absorb(z_i);
-        random_oracle.absorb(z_j);
         random_oracle.absorb(&U);
         random_oracle.absorb_non_native(&U_secondary);
 
@@ -310,7 +298,7 @@ mod tests {
     use crate::{
         circuits::nova::sequential::tests::CubicCircuit,
         commitment::CommitmentScheme,
-        nova::pcd::{compression::SNARK, PCDNode, PublicParams},
+        nova::sequential::{compression::SNARK, IVCProof, PublicParams},
         pedersen::PedersenCommitment,
         poseidon_config,
     };
@@ -418,7 +406,6 @@ mod tests {
         let circuit = CubicCircuit::<G1::ScalarField>::default();
         // First we set up a Nova PCD instance.
         let z_0 = vec![G1::ScalarField::one()];
-        let z_1 = vec![G1::ScalarField::from(7)];
 
         // We set up the public parameters both for Nova and Spartan.
         let (srs, params) = test_setup_helper::<G1, G2, PC, C2>();
@@ -433,13 +420,15 @@ mod tests {
         .unwrap();
 
         // Now, we perform a PCD proof step and check that the resulting proof verifies.
-        let nova_proof = PCDNode::prove_leaf(&params, &circuit, 0, &z_0).unwrap();
-        nova_proof.verify(&params).unwrap();
+        let num_steps = 1;
+        let mut nova_proof = IVCProof::new(&z_0);
+        nova_proof = nova_proof.prove_step(&params, &circuit).unwrap();
+        nova_proof.verify(&params, num_steps).unwrap();
 
-        assert_eq!(&nova_proof.z_j, &z_1);
+        assert_eq!(&nova_proof.z_i()[0], &G1::ScalarField::from(7));
 
         // Now, we compress the proof using Spartan
-        let compressed_pcd_proof = SNARK::<
+        let compressed_nova_proof = SNARK::<
             G1,
             G2,
             PC,
@@ -457,12 +446,11 @@ mod tests {
                  C2,
                  PoseidonSponge<G1::ScalarField>,
                  CubicCircuit<G1::ScalarField>,
-             >::verify(&key, &params, &compressed_pcd_proof)
+             >::verify(&key, &params, &compressed_nova_proof)
              .unwrap();
     }
 
     #[test]
-    #[ignore]
     fn compression_test() {
         compression_test_helper::<
             Bn254Config,
