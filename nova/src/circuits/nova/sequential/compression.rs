@@ -21,14 +21,13 @@ use crate::{
     absorb::CryptographicSpongeExt,
     commitment::CommitmentScheme,
     folding::nova::cyclefold::{
-        nimfs::{NIMFSProof, R1CSInstance, RelaxedR1CSInstance, RelaxedR1CSWitness},
+        nimfs::{NIMFSProof, R1CSInstance, R1CSShape, RelaxedR1CSInstance, RelaxedR1CSWitness},
         Error as NovaError,
     },
     nova::pcd::compression::{
         commitment_utils::PolyVectorCommitment,
         error::{ProofError, SpartanError},
     },
-    r1cs::R1CSShape,
     StepCircuit, LOG_TARGET,
 };
 
@@ -61,34 +60,32 @@ where
 }
 
 #[derive(CanonicalDeserialize, CanonicalSerialize)]
-pub struct SNARKKey<G: CurveGroup, PC: PolyCommitmentScheme<G>> {
+pub struct SNARKKey<G: SWCurveConfig, PC: PolyCommitmentScheme<Projective<G>>> {
     shape: CRR1CSShape<G::ScalarField>,
-    computation_comm: ComputationCommitment<G, PC>,
+    computation_comm: ComputationCommitment<Projective<G>, PC>,
     computation_decomm: ComputationDecommitment<G::ScalarField>,
-    snark_gens: SNARKGens<G, PC>,
+    snark_gens: SNARKGens<Projective<G>, PC>,
 }
 
-impl<G: CurveGroup, PC: PolyCommitmentScheme<G>> SNARKKey<G, PC> {
+impl<G: SWCurveConfig, PC: PolyCommitmentScheme<Projective<G>>> SNARKKey<G, PC> {
     /// convenience function to derive the minimum log size of the SRS
     /// needed to support compression for a given `shape`.
-    pub fn get_min_srs_size(shape: &R1CSShape<G>) -> usize {
-        let R1CSShape {
-            num_constraints,
-            num_vars,
-            num_io,
-            A,
-            B,
-            C,
-        } = shape;
+    pub fn get_min_srs_size(shape: &R1CSShape<G>) -> Result<usize, SpartanError> {
+        let spartan_shape: CRR1CSShape<G::ScalarField> = shape.clone().try_into().unwrap();
+        let (num_cons, num_vars, num_inputs) = (
+            spartan_shape.get_num_cons(),
+            spartan_shape.get_num_vars(),
+            spartan_shape.get_num_inputs(),
+        );
         // spartan uses the convention that num_inputs does not include the leading `u`.
-        let num_inputs = num_io - 1;
-        let num_nz_entries = max(A.len(), max(B.len(), C.len()));
-        SNARKGens::<G, PC>::get_min_num_vars(
-            *num_constraints,
-            *num_vars,
+        let num_nz_entries = max(shape.A.len(), max(shape.B.len(), shape.C.len()));
+        let min_srs_vars = SNARKGens::<Projective<G>, PC>::get_min_num_vars(
+            num_cons,
+            num_vars,
             num_inputs,
             num_nz_entries,
-        )
+        );
+        Ok(min_srs_vars)
     }
 }
 pub struct SNARK<G1, G2, PC, C2, RO, SC>
@@ -126,7 +123,7 @@ where
     pub fn setup(
         pp: &PublicParams<G1, G2, PVC<G1, PC>, C2, RO, SC>,
         srs: &PC::SRS,
-    ) -> Result<SNARKKey<Projective<G1>, PC>, SpartanError> {
+    ) -> Result<SNARKKey<G1, PC>, SpartanError> {
         let _span = tracing::debug_span!(target: LOG_TARGET, "Spartan_setup").entered();
         let PublicParams { shape: _shape, .. } = pp;
         // converts the R1CSShape from this crate into a CRR1CSShape from the Spartan crate
@@ -151,7 +148,7 @@ where
 
     pub fn compress(
         params: &PublicParams<G1, G2, PVC<G1, PC>, C2, RO, SC>,
-        key: &SNARKKey<Projective<G1>, PC>,
+        key: &SNARKKey<G1, PC>,
         ivc_proof: IVCProof<G1, G2, PVC<G1, PC>, C2, RO, SC>,
     ) -> Result<CompressedIVCProof<G1, G2, PC, C2, RO, SC>, SpartanError> {
         let _span = tracing::debug_span!(target: LOG_TARGET, "Spartan_prove").entered();
@@ -215,7 +212,7 @@ where
     }
 
     pub fn verify(
-        key: &SNARKKey<Projective<G1>, PC>,
+        key: &SNARKKey<G1, PC>,
         params: &PublicParams<G1, G2, PVC<G1, PC>, C2, RO, SC>,
         proof: &CompressedIVCProof<G1, G2, PC, C2, RO, SC>,
     ) -> Result<(), SpartanError> {
@@ -298,7 +295,10 @@ mod tests {
     use crate::{
         circuits::nova::sequential::tests::CubicCircuit,
         commitment::CommitmentScheme,
-        nova::sequential::{compression::SNARK, IVCProof, PublicParams},
+        nova::sequential::{
+            augmented::NovaAugmentedCircuit, compression::SNARK, IVCProof, PublicParams,
+            SetupParams,
+        },
         pedersen::PedersenCommitment,
         poseidon_config,
     };
@@ -339,11 +339,20 @@ mod tests {
         //     num_nz_entries,
         // )
         // let srs = PC::setup(min_num_vars, b"test_srs", rng).unwrap();
-        const NUM_VARS: usize = 26;
         let mut rng = test_rng();
         let ro_config = poseidon_config();
         let step_circuit = CubicCircuit::<G1::ScalarField>::default();
-        let srs = PC::setup(NUM_VARS, b"test_srs", &mut rng).unwrap();
+        let (shape, _) = SetupParams::<(
+            G1,
+            G2,
+            PVC<G1, PC>,
+            C2,
+            PoseidonSponge<G1::ScalarField>,
+            CubicCircuit<G1::ScalarField>,
+        )>::get_shape(ro_config.clone(), &step_circuit)
+        .unwrap();
+        let min_num_vars = SNARKKey::<G1, PC>::get_min_srs_size(&shape).unwrap();
+        let srs = PC::setup(min_num_vars, b"test_srs", &mut rng).unwrap();
         let params = PublicParams::<
             G1,
             G2,

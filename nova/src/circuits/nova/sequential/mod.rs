@@ -108,6 +108,43 @@ where
     }
 }
 
+impl<G1, G2, C1, C2, RO, SC> SetupParams<(G1, G2, C1, C2, RO, SC)>
+where
+    G1: SWCurveConfig,
+    G2: SWCurveConfig<BaseField = G1::ScalarField, ScalarField = G1::BaseField>,
+    G1::BaseField: PrimeField + Absorb,
+    G2::BaseField: PrimeField + Absorb,
+    C1: CommitmentScheme<Projective<G1>>,
+    C2: CommitmentScheme<Projective<G2>>,
+    RO: SpongeWithGadget<G1::ScalarField> + Send + Sync,
+    RO::Var: CryptographicSpongeVar<G1::ScalarField, RO, Parameters = RO::Config>,
+    RO::Config: CanonicalSerialize + CanonicalDeserialize + Sync,
+    SC: StepCircuit<G1::ScalarField>,
+{
+    pub fn get_shape(
+        ro_config: <RO as CryptographicSponge>::Config,
+        step_circuit: &SC,
+    ) -> Result<(R1CSShape<G1>, R1CSShape<G2>), cyclefold::Error> {
+        let z_0 = vec![G1::ScalarField::ZERO; SC::ARITY];
+
+        let cs = ConstraintSystem::new_ref();
+        cs.set_mode(SynthesisMode::Setup);
+
+        let input = NovaAugmentedCircuitInput::<G1, G2, C1, C2, RO>::Base {
+            vk: G1::ScalarField::ZERO,
+            z_0,
+        };
+        let circuit = NovaAugmentedCircuit::new(&ro_config, step_circuit, input);
+        let _ = NovaConstraintSynthesizer::generate_constraints(circuit, cs.clone())?;
+
+        cs.finalize();
+
+        let shape = R1CSShape::from(cs);
+        let shape_secondary = cyclefold::secondary::setup_shape::<G1, G2>()?;
+        Ok((shape, shape_secondary))
+    }
+}
+
 pub type PublicParams<G1, G2, C1, C2, RO, SC> =
     public_params::PublicParams<G1, G2, C1, C2, RO, SC, SetupParams<(G1, G2, C1, C2, RO, SC)>>;
 
