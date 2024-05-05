@@ -93,7 +93,7 @@ where
 
     let num_vars = poly.get_num_vars();
     // Make sure that the SRS has been trimmed to support the number of variables in `poly`.
-    assert_eq!(num_vars, ck.supported_num_vars());
+    assert!(num_vars <= ck.supported_num_vars());
     assert_eq!(truncated_quotients.len(), num_vars);
 
     // Now, we commit to these truncated quotients, send the commitments to the verifier, and extract a challenge.
@@ -189,7 +189,7 @@ where
       proof,
     } = proof;
     let num_vars = u.len();
-    assert_eq!(num_vars, vk.supported_num_vars);
+    assert!(num_vars <= vk.supported_num_vars);
     // We absorb the public inputs into the transcript
     <Transcript as ProofTranscript<E::G1>>::append_protocol_name(
       transcript,
